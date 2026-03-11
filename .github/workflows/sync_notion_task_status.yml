@@ -1,0 +1,230 @@
+name: Sync Notion task status
+on:
+  workflow_call:
+    inputs:
+      action:
+        required: true
+        type: string
+      merged:
+        required: true
+        type: boolean
+      base_ref:
+        required: true
+        type: string
+      head_ref:
+        required: true
+        type: string
+      title:
+        required: true
+        type: string
+    secrets:
+      NOTION_TOKEN:
+        required: true
+      NOTION_DB_ID:
+        required: true
+      NOTION_TITLE_PROP:
+        required: false
+      NOTION_STATUS_PROP:
+        required: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Decide target status
+        id: status
+        shell: bash
+        run: |
+          ACTION="${{ inputs.action }}"
+          MERGED="${{ inputs.merged }}"
+          BASE_REF="${{ inputs.base_ref }}"
+
+          STATUS=""
+
+          if [[ "$ACTION" == "opened" || "$ACTION" == "reopened" ]]; then
+            STATUS="In Progress"
+          elif [[ "$ACTION" == "review_requested" || "$ACTION" == "ready_for_review" ]]; then
+            STATUS="In Review"
+          elif [[ "$ACTION" == "closed" && "$MERGED" == "true" ]]; then
+            if [[ "$BASE_REF" == "staging" ]]; then
+              STATUS="In Stg"
+            elif [[ "$BASE_REF" == "main" || "$BASE_REF" == "master" || "$BASE_REF" == "production" ]]; then
+              STATUS="Done"
+            fi
+          fi
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: Skip when no status change is needed
+        if: steps.status.outputs.status == ''
+        run: echo "No Notion update needed"
+
+      - name: Extract Notion key
+        if: steps.status.outputs.status != ''
+        id: key
+        shell: bash
+        run: |
+          # Key extraction policy:
+          # 1) Prefer branch naming rule: category/ticket/description
+          # 2) If ticket is unavailable, fallback to PR title regex
+          HEAD_REF="${{ inputs.head_ref }}"
+          TITLE="${{ inputs.title }}"
+          KEY=""
+
+          # Branch rule example: feat/DEV-1271/sync-notion-status
+          # We extract the 2nd path segment as ticket.
+          BRANCH_TICKET="$(echo "$HEAD_REF" | cut -d '/' -f2)"
+          if [[ -n "$BRANCH_TICKET" && "$BRANCH_TICKET" != "no-ref" && "$BRANCH_TICKET" =~ ^[A-Za-z]+-[0-9]+$ ]]; then
+            KEY="$BRANCH_TICKET"
+          fi
+
+          # Fallback: pick first ticket-like token from PR title.
+          if [[ -z "$KEY" ]]; then
+            KEY="$(echo "$TITLE" | grep -oE '[A-Za-z]+-[0-9]+' | head -n 1 || true)"
+          fi
+
+          KEY="$(echo "$KEY" | tr '[:lower:]' '[:upper:]')"
+
+          if [[ -z "$KEY" ]]; then
+            echo "No Notion key found from branch/title"
+            echo "notion_key=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "notion_key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Skip when no Notion key is found
+        if: steps.status.outputs.status != '' && steps.key.outputs.notion_key == ''
+        run: echo "No key found. Skip Notion update."
+
+      - name: Validate required Notion secrets
+        if: steps.status.outputs.status != '' && steps.key.outputs.notion_key != ''
+        shell: bash
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
+        run: |
+          if [[ -z "$NOTION_TOKEN" || -z "$NOTION_DB_ID" ]]; then
+            echo "::error::Missing required secrets: NOTION_TOKEN and/or NOTION_DB_ID"
+            exit 1
+          fi
+
+      - name: Update Notion
+        if: steps.status.outputs.status != '' && steps.key.outputs.notion_key != ''
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
+          NOTION_KEY: ${{ steps.key.outputs.notion_key }}
+          TARGET_STATUS: ${{ steps.status.outputs.status }}
+          NOTION_TITLE_PROP: ${{ secrets.NOTION_TITLE_PROP }}
+          NOTION_STATUS_PROP: ${{ secrets.NOTION_STATUS_PROP }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+          from urllib.parse import unquote, urlparse
+
+          notion_token = os.environ["NOTION_TOKEN"]
+          notion_db_id_input = os.environ["NOTION_DB_ID"]
+          notion_key = os.environ["NOTION_KEY"]
+          target_status = os.environ["TARGET_STATUS"]
+          notion_title_prop = os.environ.get("NOTION_TITLE_PROP") or "タスク名" # 変更があったら、Github SecretsのNOTION_TITLE_PROPに更新してOK
+          notion_status_prop = os.environ.get("NOTION_STATUS_PROP") or "ステータス" # 変更があったら、Github SecretsのNOTION_STATUS_PROPに更新してOK
+
+          notion_version = "2022-06-28"
+
+          def normalize_notion_database_id(value):
+              # Accept a full Notion URL, UUID, or raw 32-char id.
+              text = value.strip()
+              path_or_id = unquote(urlparse(text).path) if "://" in text else text
+              compact = path_or_id.replace("-", "")
+              match = re.search(r"([0-9a-fA-F]{32})", compact)
+              if not match:
+                  raise ValueError(
+                      "Invalid NOTION_DB_ID format. Use Notion URL / UUID / 32-char id."
+                  )
+              return match.group(1).lower()
+
+          try:
+              notion_db_id = normalize_notion_database_id(notion_db_id_input)
+          except ValueError as err:
+              print(str(err))
+              sys.exit(1)
+
+          # Debug info without exposing secrets.
+          print(f"notion_db_id_normalized_length={len(notion_db_id)}")
+          print(f"notion_title_prop={notion_title_prop}")
+          print(f"notion_status_prop={notion_status_prop}")
+
+          def notion_request(url, method="GET", body=None):
+              headers = {
+                  "Authorization": f"Bearer {notion_token}",
+                  "Notion-Version": notion_version,
+              }
+              data = None
+              if body is not None:
+                  headers["Content-Type"] = "application/json"
+                  data = json.dumps(body).encode("utf-8")
+
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return json.loads(resp.read().decode("utf-8"))
+              except urllib.error.HTTPError as err:
+                  detail = err.read().decode("utf-8")
+                  print(f"HTTPError {err.code}: {detail}")
+                  raise
+
+          query_body = {
+              "page_size": 10,
+              "filter": {
+                  "property": notion_title_prop,
+                  "title": {
+                      "contains": notion_key
+                  }
+              }
+          }
+
+          result = notion_request(
+              f"https://api.notion.com/v1/databases/{notion_db_id}/query",
+              method="POST",
+              body=query_body,
+          )
+
+          pages = result.get("results", [])
+          if not pages:
+              print(f"No Notion page found for key: {notion_key}")
+              sys.exit(1)
+
+          target_page = pages[0]
+          for page in pages:
+              title_parts = page["properties"][notion_title_prop]["title"]
+              plain = "".join(part.get("plain_text", "") for part in title_parts)
+              if plain.upper().startswith(f"[{notion_key}]") or plain.upper().startswith(notion_key):
+                  target_page = page
+                  break
+
+          page_id = target_page["id"]
+
+          update_body = {
+              "properties": {
+                  notion_status_prop: {
+                      "status": {
+                          "name": target_status
+                      }
+                  }
+              }
+          }
+
+          notion_request(
+              f"https://api.notion.com/v1/pages/{page_id}",
+              method="PATCH",
+              body=update_body,
+          )
+
+          print(f"Updated {notion_key} -> {target_status}")
+          PY
