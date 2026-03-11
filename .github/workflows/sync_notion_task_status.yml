@@ -42,7 +42,7 @@ jobs:
 
           STATUS=""
 
-          if [[ "$ACTION" == "opened" || "$ACTION" == "reopened" ]]; then
+          if [[ "$ACTION" == "opened" || "$ACTION" == "reopened" || "$ACTION" == "synchronize" ]]; then
             STATUS="In Progress"
           elif [[ "$ACTION" == "review_requested" || "$ACTION" == "ready_for_review" ]]; then
             STATUS="In Review"
@@ -58,7 +58,9 @@ jobs:
 
       - name: Skip when no status change is needed
         if: steps.status.outputs.status == ''
-        run: echo "No Notion update needed"
+        run: |
+          echo "Skip reason: No status mapping for this event/context"
+          echo "action=${{ inputs.action }} merged=${{ inputs.merged }} base_ref=${{ inputs.base_ref }}"
 
       - name: Extract Notion key
         if: steps.status.outputs.status != ''
@@ -96,7 +98,10 @@ jobs:
 
       - name: Skip when no Notion key is found
         if: steps.status.outputs.status != '' && steps.key.outputs.notion_key == ''
-        run: echo "No key found. Skip Notion update."
+        run: |
+          echo "Skip reason: Notion key could not be extracted from branch/title"
+          echo "head_ref=${{ inputs.head_ref }}"
+          echo "title=${{ inputs.title }}"
 
       - name: Validate required Notion secrets
         if: steps.status.outputs.status != '' && steps.key.outputs.notion_key != ''
