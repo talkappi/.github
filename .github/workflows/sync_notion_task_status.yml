@@ -184,34 +184,50 @@ jobs:
                   print(f"HTTPError {err.code}: {detail}")
                   raise
 
-          query_body = {
-              "page_size": 10,
-              "filter": {
+          def query_db(filter_body):
+              result = notion_request(
+                  f"https://api.notion.com/v1/databases/{notion_db_id}/query",
+                  method="POST",
+                  body={"page_size": 10, "filter": filter_body},
+              )
+              return result.get("results", [])
+
+          # Step 1: search by "ID" property (unique_id type in Notion)
+          target_page = None
+          pages = query_db({
+              "property": "ID",
+              "unique_id": {
+                  "equals": notion_key
+              }
+          })
+          if pages:
+              target_page = pages[0]
+              print(f"Found page by ID property: {notion_key}")
+
+          # Step 2: fallback — search by title containing the key
+          if target_page is None:
+              pages = query_db({
                   "property": notion_title_prop,
                   "title": {
                       "contains": notion_key
                   }
-              }
-          }
+              })
+              if pages:
+                  # Prefer a page whose title starts with the key
+                  for page in pages:
+                      title_parts = page["properties"][notion_title_prop]["title"]
+                      plain = "".join(part.get("plain_text", "") for part in title_parts)
+                      if plain.upper().startswith(f"[{notion_key}]") or plain.upper().startswith(notion_key):
+                          target_page = page
+                          break
+                  if target_page is None:
+                      target_page = pages[0]
+                  print(f"Found page by title search: {notion_key}")
 
-          result = notion_request(
-              f"https://api.notion.com/v1/databases/{notion_db_id}/query",
-              method="POST",
-              body=query_body,
-          )
-
-          pages = result.get("results", [])
-          if not pages:
-              print(f"No Notion page found for key: {notion_key}")
-              sys.exit(1)
-
-          target_page = pages[0]
-          for page in pages:
-              title_parts = page["properties"][notion_title_prop]["title"]
-              plain = "".join(part.get("plain_text", "") for part in title_parts)
-              if plain.upper().startswith(f"[{notion_key}]") or plain.upper().startswith(notion_key):
-                  target_page = page
-                  break
+          # Step 3: skip gracefully if still not found
+          if target_page is None:
+              print(f"No Notion page found for key: {notion_key} — skipping")
+              sys.exit(0)
 
           page_id = target_page["id"]
 
