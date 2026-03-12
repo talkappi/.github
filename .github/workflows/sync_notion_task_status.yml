@@ -192,17 +192,20 @@ jobs:
               )
               return result.get("results", [])
 
-          # Step 1: search by "ID" property (unique_id type in Notion)
+          # Step 1: search by "ID" property (unique_id type in Notion).
+          # unique_id.equals requires an integer — extract the numeric suffix from the key.
           target_page = None
-          pages = query_db({
-              "property": "ID",
-              "unique_id": {
-                  "equals": notion_key
-              }
-          })
-          if pages:
-              target_page = pages[0]
-              print(f"Found page by ID property: {notion_key}")
+          id_number_match = re.search(r"(\d+)$", notion_key)
+          if id_number_match:
+              pages = query_db({
+                  "property": "ID",
+                  "unique_id": {
+                      "equals": int(id_number_match.group(1))
+                  }
+              })
+              if pages:
+                  target_page = pages[0]
+                  print(f"Found page by ID property: {notion_key}")
 
           # Step 2: fallback — search by title containing the key
           if target_page is None:
