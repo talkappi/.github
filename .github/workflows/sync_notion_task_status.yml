@@ -90,21 +90,12 @@ jobs:
 
           if [[ -z "$KEY" ]]; then
             echo "No Notion key found from branch/title"
-            echo "notion_key=" >> "$GITHUB_OUTPUT"
-            exit 0
           fi
 
           echo "notion_key=$KEY" >> "$GITHUB_OUTPUT"
 
-      - name: Skip when no Notion key is found
-        if: steps.status.outputs.status != '' && steps.key.outputs.notion_key == ''
-        run: |
-          echo "Skip reason: Notion key could not be extracted from branch/title"
-          echo "head_ref=${{ inputs.head_ref }}"
-          echo "title=${{ inputs.title }}"
-
       - name: Validate required Notion secrets
-        if: steps.status.outputs.status != '' && steps.key.outputs.notion_key != ''
+        if: steps.status.outputs.status != ''
         shell: bash
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -116,7 +107,7 @@ jobs:
           fi
 
       - name: Update Notion
-        if: steps.status.outputs.status != '' && steps.key.outputs.notion_key != ''
+        if: steps.status.outputs.status != ''
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
@@ -124,6 +115,9 @@ jobs:
           TARGET_STATUS: ${{ steps.status.outputs.status }}
           NOTION_TITLE_PROP: ${{ secrets.NOTION_TITLE_PROP }}
           NOTION_STATUS_PROP: ${{ secrets.NOTION_STATUS_PROP }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 <<'PY'
           import json
@@ -135,10 +129,13 @@ jobs:
 
           notion_token = os.environ["NOTION_TOKEN"]
           notion_db_id_input = os.environ["NOTION_DB_ID"]
-          notion_key = os.environ["NOTION_KEY"]
+          notion_key = os.environ.get("NOTION_KEY", "")
           target_status = os.environ["TARGET_STATUS"]
           notion_title_prop = os.environ.get("NOTION_TITLE_PROP") or "タスク名" # 変更があったら、Github SecretsのNOTION_TITLE_PROPに更新してOK
           notion_status_prop = os.environ.get("NOTION_STATUS_PROP") or "ステータス" # 変更があったら、Github SecretsのNOTION_STATUS_PROPに更新してOK
+          pr_body = os.environ.get("PR_BODY", "")
+          github_repository = os.environ.get("GITHUB_REPOSITORY", "")
+          github_token = os.environ.get("GITHUB_TOKEN", "")
 
           notion_version = "2022-06-28"
 
@@ -174,7 +171,6 @@ jobs:
               if body is not None:
                   headers["Content-Type"] = "application/json"
                   data = json.dumps(body).encode("utf-8")
-
               req = urllib.request.Request(url, data=data, headers=headers, method=method)
               try:
                   with urllib.request.urlopen(req) as resp:
@@ -182,6 +178,21 @@ jobs:
               except urllib.error.HTTPError as err:
                   detail = err.read().decode("utf-8")
                   print(f"HTTPError {err.code}: {detail}")
+                  raise
+
+          def github_request(url):
+              headers = {
+                  "Authorization": f"Bearer {github_token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              }
+              req = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return json.loads(resp.read().decode("utf-8"))
+              except urllib.error.HTTPError as err:
+                  detail = err.read().decode("utf-8")
+                  print(f"GitHub API HTTPError {err.code}: {detail}")
                   raise
 
           def query_db(filter_body):
@@ -192,63 +203,85 @@ jobs:
               )
               return result.get("results", [])
 
-          # Step 1: search by "ID" property (unique_id type in Notion).
-          # unique_id.equals requires an integer — extract the numeric suffix from the key.
-          target_page = None
-          id_number_match = re.search(r"(\d+)$", notion_key)
-          if id_number_match:
-              pages = query_db({
-                  "property": "ID",
-                  "unique_id": {
-                      "equals": int(id_number_match.group(1))
-                  }
-              })
-              if pages:
-                  target_page = pages[0]
-                  print(f"Found page by ID property: {notion_key}")
-
-          # Step 2: fallback — search by title containing the key
-          if target_page is None:
+          def find_notion_page(key):
+              # Step 1: search by ID property (unique_id).
+              # unique_id.equals requires an integer — extract the numeric suffix.
+              id_number_match = re.search(r"(\d+)$", key)
+              if id_number_match:
+                  pages = query_db({
+                      "property": "ID",
+                      "unique_id": {"equals": int(id_number_match.group(1))}
+                  })
+                  if pages:
+                      print(f"Found page by ID property: {key}")
+                      return pages[0]
+              # Step 2: search by title containing the key.
               pages = query_db({
                   "property": notion_title_prop,
-                  "title": {
-                      "contains": notion_key
-                  }
+                  "title": {"contains": key}
               })
               if pages:
-                  # Prefer a page whose title starts with the key
                   for page in pages:
                       title_parts = page["properties"][notion_title_prop]["title"]
                       plain = "".join(part.get("plain_text", "") for part in title_parts)
-                      if plain.upper().startswith(f"[{notion_key}]") or plain.upper().startswith(notion_key):
-                          target_page = page
-                          break
-                  if target_page is None:
-                      target_page = pages[0]
-                  print(f"Found page by title search: {notion_key}")
+                      if plain.upper().startswith(f"[{key}]") or plain.upper().startswith(key):
+                          print(f"Found page by title search: {key}")
+                          return page
+                  print(f"Found page by title search (best match): {key}")
+                  return pages[0]
+              return None
 
-          # Step 3: skip gracefully if still not found
-          if target_page is None:
-              print(f"No Notion page found for key: {notion_key} — skipping")
+          def update_notion_page(page_id, key):
+              notion_request(
+                  f"https://api.notion.com/v1/pages/{page_id}",
+                  method="PATCH",
+                  body={"properties": {notion_status_prop: {"status": {"name": target_status}}}},
+              )
+              print(f"Updated {key} -> {target_status}")
+
+          # ── Collect ticket keys to update ──────────────────────────────────
+          # Start with the key extracted from the branch/title (may be empty).
+          keys_to_update = [notion_key] if notion_key else []
+
+          # Always resolve sub-PRs referenced in the PR body (works for any PR,
+          # including release PRs like staging→main that bundle multiple tickets).
+          if pr_body and github_repository and github_token:
+              pr_numbers = re.findall(r'#(\d+)', pr_body)
+              if pr_numbers:
+                  print(f"Resolving sub-PRs {pr_numbers} from PR body")
+              for pr_num in pr_numbers:
+                  try:
+                      pr_data = github_request(
+                          f"https://api.github.com/repos/{github_repository}/pulls/{pr_num}"
+                      )
+                  except Exception:
+                      print(f"  Sub-PR #{pr_num}: failed to fetch, skipping")
+                      continue
+                  head_ref = pr_data.get("head", {}).get("ref", "")
+                  parts = head_ref.split("/")
+                  branch_ticket = parts[1] if len(parts) >= 2 else ""
+                  key = ""
+                  if branch_ticket and re.match(r'^[A-Za-z]+-[0-9]+$', branch_ticket):
+                      key = branch_ticket.upper()
+                  if not key:
+                      m = re.search(r'[A-Za-z]+-[0-9]+', pr_data.get("title", ""))
+                      if m:
+                          key = m.group(0).upper()
+                  if key and key not in keys_to_update:
+                      keys_to_update.append(key)
+                      print(f"  Sub-PR #{pr_num} (branch={head_ref}) -> {key}")
+                  else:
+                      print(f"  Sub-PR #{pr_num} (branch={head_ref}) -> no ticket key, skipping")
+
+          if not keys_to_update:
+              print("No ticket keys to update — skipping")
               sys.exit(0)
 
-          page_id = target_page["id"]
-
-          update_body = {
-              "properties": {
-                  notion_status_prop: {
-                      "status": {
-                          "name": target_status
-                      }
-                  }
-              }
-          }
-
-          notion_request(
-              f"https://api.notion.com/v1/pages/{page_id}",
-              method="PATCH",
-              body=update_body,
-          )
-
-          print(f"Updated {notion_key} -> {target_status}")
+          # ── Update each ticket ─────────────────────────────────────────────
+          for key in keys_to_update:
+              page = find_notion_page(key)
+              if page is None:
+                  print(f"No Notion page found for key: {key} — skipping")
+                  continue
+              update_notion_page(page["id"], key)
           PY
